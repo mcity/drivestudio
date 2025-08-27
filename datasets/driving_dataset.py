@@ -459,6 +459,15 @@ class DrivingDataset(SceneDataset):
                     collected_lidar_pts.append(valid_pts)
                     collected_lidar_colors.append(valid_colors)
                 
+                collected_lidar_pts = [p for p in collected_lidar_pts if p.numel() > 0]
+                collected_lidar_colors = [c for c in collected_lidar_colors if c.numel() > 0]
+                if len(collected_lidar_pts) == 0:
+                    pts = torch.empty(0, 3, device=self.pixel_source.instances_pose.device)
+                    colors = torch.empty(0, 3, device=self.pixel_source.instances_pose.device)
+                else:
+                    pts = torch.cat(collected_lidar_pts, dim=0)
+                    colors = torch.cat(collected_lidar_colors, dim=0)
+
                 instance_dict[ins_id] = {
                     "node_type": "SMPLNodes",
                     "smpl_quats": smpl_quats,           # [frame_num, 24, 4]
@@ -466,8 +475,8 @@ class DrivingDataset(SceneDataset):
                     "smpl_betas": first_frame_betas,    # [10]
                     "size":       size,                 # [3]
                     "frame_info": frame_info,           # [frame_num]
-                    "pts": torch.cat(collected_lidar_pts, dim=0),
-                    "colors": torch.cat(collected_lidar_colors, dim=0),
+                    "pts": pts,
+                    "colors": colors,
                 }
         
         return instance_dict

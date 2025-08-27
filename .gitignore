@@ -29,6 +29,8 @@ sky_masks/
 fine_dynamic_masks_example/
 *.sh
 pandaset-devkit/
+calibration_files/
+*.mp4
 
 # C extensions
 *.so
