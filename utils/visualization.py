@@ -34,9 +34,33 @@ def get_layout(dataset_type: str):
         layout = layout_kitti
     elif dataset_type == "nuplan":
         layout = layout_nuplan
+    elif dataset_type == "mcity":
+        layout = layout_mcity
     else:
         raise ValueError(f"dataset_type {dataset_type} not supported")
     return layout
+
+
+def layout_mcity(
+    imgs: List[np.array], cam_names: List[str]
+) -> np.array:
+    """Tile arenacam1..arenacam6 in a 2x3 grid (top row: 1,2,3; bottom: 4,5,6)."""
+    channel = imgs[0].shape[-1]
+    h, w = imgs[0].shape[:2]
+    tiled = np.zeros((h * 2, w * 3, channel), dtype=np.float32)
+    filled = np.zeros((h * 2, w * 3), dtype=np.uint8)
+    slots = {
+        "arenacam1": (0, 0), "arenacam2": (0, 1), "arenacam3": (0, 2),
+        "arenacam4": (1, 0), "arenacam5": (1, 1), "arenacam6": (1, 2),
+    }
+    for idx, name in enumerate(cam_names):
+        if name not in slots:
+            continue
+        ry, rx = slots[name]
+        tiled[ry * h:(ry + 1) * h, rx * w:(rx + 1) * w] = imgs[idx]
+        filled[ry * h:(ry + 1) * h, rx * w:(rx + 1) * w] = 1
+    ys, xs = np.where(filled)
+    return tiled[ys.min():ys.max(), xs.min():xs.max()]
 
 def layout_nuplan(
     imgs: List[np.array], cam_names: List[str]

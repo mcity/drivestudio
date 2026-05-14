@@ -1,0 +1,33 @@
+# Mcity dataset configuration (6 cameras, background-only)
+# Cameras: 0..5 = arenacam1..arenacam6, native 1920x1200
+
+data:
+  data_root: data/mcity/processed/training
+  dataset: mcity
+  scene_idx: 0
+  start_timestep: 0
+  end_timestep: -1
+  preload_device: cuda
+  pixel_source:
+    type: datasets.waymo.waymo_sourceloader.WaymoPixelSource
+    cameras: [0, 1, 2, 3, 4, 5]
+    downscale_when_loading: [2, 2, 2, 2, 2, 2]
+    downscale: 1
+    undistort: True
+    test_image_stride: 0
+    load_sky_mask: True       # dummy zero-masks written by preprocess; needed for trainer shape
+    load_dynamic_mask: False
+    load_objects: False
+    load_smpl: False
+    sampler:
+      buffer_downscale: 8
+      buffer_ratio: 0.5
+      start_enhance_weight: 3
+  lidar_source:
+    type: datasets.waymo.waymo_sourceloader.WaymoLiDARSource
+    load_lidar: True
+    only_use_top_lidar: False
+    truncated_max_range: 80
+    truncated_min_range: -2
+    lidar_downsample_factor: 4
+    lidar_percentile: 0.02

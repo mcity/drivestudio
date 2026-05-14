@@ -131,6 +131,10 @@ class CameraData(object):
         ]
         
         # Load the images, dynamic masks, sky masks, etc.
+        self.dynamic_masks = None
+        self.human_masks = None
+        self.vehicle_masks = None
+        self.sky_masks = None
         self.create_all_filelist()
         self.load_calibrations()
         self.load_images()

@@ -139,6 +139,38 @@ DATASETS_CONFIG = {
             "egocar_visible": False
         }
     },
+    "mcity": {
+        0: {
+            "camera_name": "arenacam1",
+            "original_size": (1200, 1920),
+            "egocar_visible": False,
+        },
+        1: {
+            "camera_name": "arenacam2",
+            "original_size": (1200, 1920),
+            "egocar_visible": False,
+        },
+        2: {
+            "camera_name": "arenacam3",
+            "original_size": (1200, 1920),
+            "egocar_visible": False,
+        },
+        3: {
+            "camera_name": "arenacam4",
+            "original_size": (1200, 1920),
+            "egocar_visible": False,
+        },
+        4: {
+            "camera_name": "arenacam5",
+            "original_size": (1200, 1920),
+            "egocar_visible": False,
+        },
+        5: {
+            "camera_name": "arenacam6",
+            "original_size": (1200, 1920),
+            "egocar_visible": False,
+        },
+    },
     "nuplan": {
         0: {
             "camera_name": "CAM_F0",

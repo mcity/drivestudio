@@ -248,14 +248,16 @@ class MultiTrainer(BasicTrainer):
         )
         
         # render sky
-        sky_model = self.models['Sky']
-        outputs["rgb_sky"] = sky_model(image_infos)
-        outputs["rgb_sky_blend"] = outputs["rgb_sky"] * (1.0 - outputs["opacity"])
-        
+        if 'Sky' in self.models:
+            sky_model = self.models['Sky']
+            outputs["rgb_sky"] = sky_model(image_infos)
+            outputs["rgb_sky_blend"] = outputs["rgb_sky"] * (1.0 - outputs["opacity"])
+            rgb_with_sky = outputs["rgb_gaussians"] + outputs["rgb_sky"] * (1.0 - outputs["opacity"])
+        else:
+            rgb_with_sky = outputs["rgb_gaussians"]
+
         # affine transformation
-        outputs["rgb"] = self.affine_transformation(
-            outputs["rgb_gaussians"] + outputs["rgb_sky"] * (1.0 - outputs["opacity"]), image_infos
-        )
+        outputs["rgb"] = self.affine_transformation(rgb_with_sky, image_infos)
         
         if not self.training and self.render_each_class:
             with torch.no_grad():
