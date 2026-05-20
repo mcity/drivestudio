@@ -27,10 +27,11 @@ method_compare/
 simulated_results/
 sky_masks/
 fine_dynamic_masks_example/
-*.sh
 pandaset-devkit/
 calibration_files/
 *.mp4
+*.jpg
+*.png
 
 # C extensions
 *.so

@@ -1,24 +1,27 @@
-"""Convert one or more Mcity ROS2 mcap bags into a Waymo-format scene.
+"""Convert one or more Mcity ROS2 mcap bags into a drivestudio scene.
 
 Multiple bags are stitched into a single scene with frame indices that
 continue across bag boundaries. All bags must share the same `map` frame
 (true for bags recorded in the same session against the Mcity map).
 
-Mandatory outputs per frame in {out_dir}:
+Mandatory outputs per frame in {out_dir} (the on-disk layout drivestudio's
+WaymoPixelSource/WaymoLiDARSource expect — directory structure originally
+modeled after the Waymo Open Dataset preprocessing pipeline):
   images/{f:03d}_{c}.jpg         (c in 0..5 = arenacam1..6)
-  lidar/{f:03d}.bin              (N x 14 float32, Waymo schema)
+  lidar/{f:03d}.bin              (N x 14 float32, drivestudio lidar schema)
   ego_pose/{f:03d}.txt           (4x4 matrix, oxts_link -> map)
   intrinsics/{c}.txt             (9 scalars: fx, fy, cx, cy, k1, k2, p1, p2, k3)
-  extrinsics/{c}.txt             (4x4 matrix, cam -> ego, in Waymo cam convention)
+  extrinsics/{c}.txt             (4x4 matrix, cam -> ego, in FLU cam convention)
   frame_info.json                (stub metadata)
 
-LiDAR is taken from /rslidar_front_points only (v1). Other lidars are skipped
-because their per-physical-lidar-to-combined transforms are not in the
-calibration. Camera-to-ego is composed via:
+LiDAR points are gathered from /rslidar_{front,left,right}_points and all
+transformed via T_combined_to_imu — RoboSense P6 houses all three sub-lidars
+at a single coordinate frame (the combined centroid), so the per-lidar
+names in the calibration are just labels for which sub-element was used to
+calibrate each camera pair. The back lidar is recorded but not used (no
+camera covers its FOV). Each point's source is recorded in column 13 of the
+14-col bin (0=front, 1=left, 2=right). Camera-to-ego is composed via:
     T_cam_to_ego = T_combined_to_imu @ inv(T_lidar_to_cam)
-under the assumption that the calibration's `front_lidar`/`left_lidar`/
-`right_lidar` source frames are all expressed in the
-`rslidar_combined_aligned_fixed` frame. Verify with project_overlay.py.
 
 Usage (single bag):
   python tools/preprocess_mcity.py \
@@ -56,10 +59,10 @@ OPENCV2DATASET = np.array([
 
 # Mcity's oxts_link IMU body frame is FRD (X-fwd, Y-right, Z-down), as
 # confirmed by lidar_imu_extrinsic (roll ~180 deg between FLU lidar and IMU).
-# Waymo's loader assumes ego is FLU (X-fwd, Y-left, Z-up) and anchors the
-# world to ego_0, so an FRD ego makes the trained splat Z-down (upside down
-# in any Z-up viewer like Visor). Redefine ego as FLU by rotating 180 deg
-# about X:  p_flu = R @ p_frd.
+# drivestudio's loader assumes ego is FLU (X-fwd, Y-left, Z-up) and anchors
+# the world to ego_0, so an FRD ego makes the trained splat Z-down (upside
+# down in any Z-up viewer like Visor). Redefine ego as FLU by rotating 180
+# deg about X:  p_flu = R @ p_frd.
 R_FLU_FROM_FRD = np.array([
     [1, 0, 0, 0],
     [0, -1, 0, 0],
@@ -68,7 +71,16 @@ R_FLU_FROM_FRD = np.array([
 ], dtype=np.float64)
 
 ARENACAM_TOPICS = [f"/arenacam{i+1}/images" for i in range(6)]
-LIDAR_TOPIC = "/rslidar_front_points"
+# Lidar topic -> lidar_id written to column 13 of the 14-col bin. All three
+# topics share the same coordinate frame (the P6 combined centroid), so a
+# single T_combined_to_imu transforms all of them.
+LIDAR_TOPICS = {
+    "/rslidar_front_points": 0,
+    "/rslidar_left_points":  1,
+    "/rslidar_right_points": 2,
+}
+# Front lidar is the master clock for picking per-frame timestamps.
+MASTER_LIDAR_TOPIC = "/rslidar_front_points"
 TF_TOPIC = "/tf"
 
 # Cam idx 0..5 -> filename in lidar_cam_joint_extrinsics/
@@ -214,12 +226,12 @@ def process_bag(bag_path, start_s, end_s, hz, out_dir, frame_offset,
     lidar_ns = []
     tf_entries = []
     for m in read_ros2_messages(
-        bag_path, topics=[LIDAR_TOPIC, TF_TOPIC],
+        bag_path, topics=[MASTER_LIDAR_TOPIC, TF_TOPIC],
         start_time=abs_start, end_time=abs_end,
     ):
         topic = m.channel.topic
         ns = m.log_time_ns
-        if topic == LIDAR_TOPIC:
+        if topic == MASTER_LIDAR_TOPIC:
             lidar_ns.append(ns)
         elif topic == TF_TOPIC:
             for tr in m.ros_msg.transforms:
@@ -230,7 +242,7 @@ def process_bag(bag_path, start_s, end_s, hz, out_dir, frame_offset,
                     tf_entries.append((ns, T))
     lidar_ns.sort()
     tf_entries.sort(key=lambda x: x[0])
-    print(f"[pass1] lidar msgs: {len(lidar_ns)}, tf map->oxts: {len(tf_entries)}",
+    print(f"[pass1] master-lidar msgs: {len(lidar_ns)}, tf map->oxts: {len(tf_entries)}",
           flush=True)
     if not lidar_ns:
         sys.exit(f"ERROR: no front_lidar in {bag_path} window.")
@@ -267,11 +279,12 @@ def process_bag(bag_path, start_s, end_s, hz, out_dir, frame_offset,
     # --- Pass 2: stream images + lidar, buffer best per (local frame, topic) ---
     print("[pass2] streaming images + lidar...", flush=True)
     best_img = [[None] * 6 for _ in range(len(master_ns))]
-    best_lidar = [None] * len(master_ns)
+    # best_lidar[frame_idx] = {topic: (delta_ns, msg)} per lidar source
+    best_lidar = [dict() for _ in range(len(master_ns))]
 
     n_seen = 0
     for m in read_ros2_messages(
-        bag_path, topics=ARENACAM_TOPICS + [LIDAR_TOPIC],
+        bag_path, topics=ARENACAM_TOPICS + list(LIDAR_TOPICS.keys()),
         start_time=abs_start, end_time=abs_end,
     ):
         n_seen += 1
@@ -281,10 +294,10 @@ def process_bag(bag_path, start_s, end_s, hz, out_dir, frame_offset,
         idx = int(np.argmin(np.abs(master_arr - ns)))
         delta = int(abs(master_arr[idx] - ns))
         topic = m.channel.topic
-        if topic == LIDAR_TOPIC:
-            cur = best_lidar[idx]
+        if topic in LIDAR_TOPICS:
+            cur = best_lidar[idx].get(topic)
             if cur is None or delta < cur[0]:
-                best_lidar[idx] = (delta, m.ros_msg)
+                best_lidar[idx][topic] = (delta, m.ros_msg)
         else:
             cam_idx = int(topic[len("/arenacam"):].split("/")[0]) - 1
             cur = best_img[idx][cam_idx]
@@ -324,31 +337,48 @@ def process_bag(bag_path, start_s, end_s, hz, out_dir, frame_offset,
             sky = np.zeros((h, w), dtype=np.uint8)
             cv2.imwrite(str(out_dir / "sky_masks" / f"{fi_global:03d}_{ci}.png"), sky)
 
-    # --- Write lidar ---
+    # --- Write lidar (concatenate front + left + right) ---
     print("[write] lidar...", flush=True)
     origin_ego = T_combined_to_imu[:3, 3].astype(np.float32)
+    missing_counts = {topic: 0 for topic in LIDAR_TOPICS}
     for fi_local in range(len(master_ns)):
         fi_global = frame_offset + fi_local
-        entry = best_lidar[fi_local]
-        if entry is None:
-            print(f"  [warn] frame {fi_global}: no lidar", flush=True)
+        per_topic = best_lidar[fi_local]
+        if not per_topic:
+            print(f"  [warn] frame {fi_global}: no lidar from any topic", flush=True)
             continue
-        xyz, intensity = decode_pointcloud2(entry[1])
-        pts_ego = transform_points(T_combined_to_imu, xyz.astype(np.float64)).astype(np.float32)
-        n = len(pts_ego)
-        origins = np.broadcast_to(origin_ego, (n, 3)).copy()
-        flows = np.zeros((n, 3), dtype=np.float32)
-        flow_class = np.full((n, 1), -1.0, dtype=np.float32)
-        ground = np.zeros((n, 1), dtype=np.float32)
-        inten = intensity.reshape(-1, 1).astype(np.float32)
-        elong = np.zeros((n, 1), dtype=np.float32)
-        lid_id = np.zeros((n, 1), dtype=np.float32)
-        out = np.concatenate(
-            [origins, pts_ego, flows, flow_class, ground, inten, elong, lid_id],
-            axis=1,
-        )
+
+        parts = []
+        for topic, lidar_id in LIDAR_TOPICS.items():
+            entry = per_topic.get(topic)
+            if entry is None:
+                missing_counts[topic] += 1
+                continue
+            xyz, intensity = decode_pointcloud2(entry[1])
+            pts_ego = transform_points(
+                T_combined_to_imu, xyz.astype(np.float64)
+            ).astype(np.float32)
+            n = len(pts_ego)
+            origins = np.broadcast_to(origin_ego, (n, 3)).copy()
+            flows = np.zeros((n, 3), dtype=np.float32)
+            flow_class = np.full((n, 1), -1.0, dtype=np.float32)
+            ground = np.zeros((n, 1), dtype=np.float32)
+            inten = intensity.reshape(-1, 1).astype(np.float32)
+            elong = np.zeros((n, 1), dtype=np.float32)
+            lid_id = np.full((n, 1), float(lidar_id), dtype=np.float32)
+            parts.append(np.concatenate(
+                [origins, pts_ego, flows, flow_class, ground, inten, elong, lid_id],
+                axis=1,
+            ))
+
+        out = np.concatenate(parts, axis=0)
         assert out.shape[1] == 14, out.shape
         out.astype(np.float32).tofile(out_dir / "lidar" / f"{fi_global:03d}.bin")
+
+    for topic, n_missing in missing_counts.items():
+        if n_missing:
+            print(f"  [info] {topic}: missing on {n_missing}/{len(master_ns)} frames",
+                  flush=True)
 
     return len(master_ns), ego_to_map_per_frame[0], ego_to_map_per_frame[-1]
 
@@ -397,7 +427,7 @@ def main():
 
     T_combined_to_imu_frd = load_extrinsic(
         os.path.join(args.calib_root, "lidar_imu_extrinsic.json"))
-    # Re-express in FLU ego frame so downstream artifacts match Waymo's
+    # Re-express in FLU ego frame so downstream artifacts match drivestudio's
     # FLU/Z-up convention.
     T_combined_to_imu = R_FLU_FROM_FRD @ T_combined_to_imu_frd
 
@@ -406,7 +436,7 @@ def main():
     for i in range(6):
         T_cam_to_ego_opencv[i] = T_combined_to_imu @ np.linalg.inv(T_lidar_to_cam[i])
 
-    # Waymo loader applies: cam_to_ego = file @ OPENCV2DATASET
+    # drivestudio's loader applies: cam_to_ego = file @ OPENCV2DATASET
     # => file = T_cam_to_ego_opencv @ inv(OPENCV2DATASET)
     inv_o2d = np.linalg.inv(OPENCV2DATASET)
     extrinsic_for_file = {i: T_cam_to_ego_opencv[i] @ inv_o2d for i in range(6)}
