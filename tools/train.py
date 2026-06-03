@@ -166,9 +166,20 @@ def main(args):
     if cfg.render.vis_error:
         render_keys.insert(render_keys.index("rgbs") + 1, "rgb_error_maps")
     
-    # setup optimizer  
+    # setup optimizer
     trainer.initialize_optimizer()
-    
+
+    # setup Difix3D fixer (optional)
+    fixer = None
+    difix_cfg = cfg.get("difix", None)
+    if difix_cfg is not None and difix_cfg.get("enabled", False):
+        from models.difix_fixer import DifixFixer
+        fixer = DifixFixer(difix_cfg, dataset, trainer, cfg.log_dir)
+        logger.info(
+            f"Difix3D enabled: novel_prob={difix_cfg.get('novel_prob', 0.3)}, "
+            f"fix_steps={list(difix_cfg.get('fix_steps', []))}"
+        )
+
     # setup metric logger
     metrics_file = os.path.join(cfg.log_dir, "metrics.json")
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
@@ -242,26 +253,62 @@ def main(args):
         trainer.set_train()
         trainer.preprocess_per_train_step(step=step)
         trainer.optimizer_zero_grad() # zero grad
-        
-        # get data
-        train_step_camera_downscale = trainer._get_downscale_factor()
-        image_infos, cam_infos = dataset.train_image_set.next(train_step_camera_downscale)
+
+        # decide whether to sample a Difix-cleaned novel pseudo-frame
+        use_novel = (
+            fixer is not None
+            and len(fixer.pool) > 0
+            and random.random() < float(difix_cfg.get("novel_prob", 0.3))
+        )
+
+        if use_novel:
+            sample = fixer.sample()
+            image_infos = dict(sample["image_infos"])
+            cam_infos = dict(sample["cam_infos"])
+            pixels_target = sample["pixels_target"]
+        else:
+            train_step_camera_downscale = trainer._get_downscale_factor()
+            image_infos, cam_infos = dataset.train_image_set.next(train_step_camera_downscale)
+            pixels_target = None
+
         for k, v in image_infos.items():
             if isinstance(v, torch.Tensor):
                 image_infos[k] = v.cuda(non_blocking=True)
         for k, v in cam_infos.items():
             if isinstance(v, torch.Tensor):
                 cam_infos[k] = v.cuda(non_blocking=True)
-        
-        # forward & backward
-        outputs = trainer(image_infos, cam_infos)
+
+        # forward
+        if use_novel:
+            outputs = trainer(
+                image_infos=image_infos,
+                camera_infos=cam_infos,
+                novel_view=True,
+            )
+        else:
+            outputs = trainer(image_infos, cam_infos)
         trainer.update_visibility_filter()
 
-        loss_dict = trainer.compute_losses(
-            outputs=outputs,
-            image_infos=image_infos,
-            cam_infos=cam_infos,
-        )
+        if use_novel:
+            rendered = outputs["rgb"]
+            pixels_target = pixels_target.to(rendered.device)
+            Ll1 = torch.abs(rendered - pixels_target).mean()
+            sim = trainer.ssim(
+                rendered.permute(2, 0, 1)[None, ...],
+                pixels_target.permute(2, 0, 1)[None, ...],
+            )
+            ssim_loss = 1.0 - sim
+            ssim_lambda = float(difix_cfg.get("ssim_lambda", 0.2))
+            novel_loss = (1.0 - ssim_lambda) * Ll1 + ssim_lambda * ssim_loss
+            novel_loss = novel_loss * float(difix_cfg.get("novel_data_lambda", 0.3))
+            loss_dict = {"novel_rgb_loss": novel_loss}
+        else:
+            loss_dict = trainer.compute_losses(
+                outputs=outputs,
+                image_infos=image_infos,
+                cam_infos=cam_infos,
+            )
+
         # check nan or inf
         for k, v in loss_dict.items():
             if torch.isnan(v).any():
@@ -269,19 +316,24 @@ def main(args):
             if torch.isinf(v).any():
                 raise ValueError(f"Inf detected in loss {k} at step {step}")
         trainer.backward(loss_dict)
-        
+
         # after training step
         trainer.postprocess_per_train_step(step=step)
+
+        # run Difix fixer at the scheduled steps
+        if fixer is not None and fixer.should_fix(step):
+            fixer.fix(step)
         
         #----------------------------------------------------------------------------
         #-------------------------------  logging  ----------------------------------
-        with torch.no_grad():
-            # cal stats
-            metric_dict = trainer.compute_metrics(
-                outputs=outputs,
-                image_infos=image_infos,
-            )
-        metric_logger.update(**{"train_metrics/"+k: v.item() for k, v in metric_dict.items()})
+        if not use_novel:
+            with torch.no_grad():
+                # cal stats
+                metric_dict = trainer.compute_metrics(
+                    outputs=outputs,
+                    image_infos=image_infos,
+                )
+            metric_logger.update(**{"train_metrics/"+k: v.item() for k, v in metric_dict.items()})
         metric_logger.update(**{"train_stats/gaussian_num_" + k: v for k, v in trainer.get_gaussian_count().items()})
         metric_logger.update(**{"losses/"+k: v.item() for k, v in loss_dict.items()})
         metric_logger.update(**{"train_stats/lr_" + group['name']: group['lr'] for group in trainer.optimizer.param_groups})
@@ -293,12 +345,17 @@ def main(args):
         do_save = step > 0 and (
             (step % cfg.logging.saveckpt_freq == 0) or (step == trainer.num_iters)
         ) and (args.resume_from is None)
-        if do_save:  
+        if do_save:
             trainer.save_checkpoint(
                 log_dir=cfg.log_dir,
                 save_only_model=True,
                 is_final=step == trainer.num_iters,
             )
+            if difix_cfg is not None:
+                difix_dir = os.path.join(cfg.log_dir, "difix_configs")
+                os.makedirs(difix_dir, exist_ok=True)
+                suffix = "final" if step == trainer.num_iters else f"{step}"
+                OmegaConf.save(difix_cfg, os.path.join(difix_dir, f"difix_{suffix}.yaml"))
         
         #----------------------------------------------------------------------------
         #------------------------    Cache Image Error    ---------------------------

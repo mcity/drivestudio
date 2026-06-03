@@ -216,10 +216,15 @@ def process_bag(bag_path, start_s, end_s, hz, out_dir, frame_offset,
 
     bag_start_ns, bag_end_ns = get_bag_time_range(bag_path)
     abs_start = bag_start_ns + int(start_s * 1e9)
-    abs_end = bag_start_ns + int(end_s * 1e9)
+    if isinstance(end_s, str) and end_s == "end":
+        abs_end = bag_end_ns
+        end_s = (bag_end_ns - bag_start_ns) / 1e9
+    else:
+        abs_end = bag_start_ns + int(end_s * 1e9)
     print(f"[info] bag span: {bag_start_ns} .. {bag_end_ns}  "
           f"(duration {(bag_end_ns - bag_start_ns)/1e9:.1f} s)", flush=True)
-    print(f"[info] window:   {abs_start} .. {abs_end}", flush=True)
+    print(f"[info] window:   {abs_start} .. {abs_end}  "
+          f"({start_s}..{end_s:.2f} s)", flush=True)
 
     # --- Pass 1: gather lidar timestamps + tf transforms ---
     print("[pass1] scanning lidar + tf...", flush=True)
@@ -390,8 +395,10 @@ def main():
                              "to stitch multiple bags into one scene.")
     parser.add_argument("--start_s", action="append", type=float, required=True,
                         help="Per-bag start time (s). Repeat once per --bag_path.")
-    parser.add_argument("--end_s", action="append", type=float, required=True,
-                        help="Per-bag end time (s). Repeat once per --bag_path.")
+    parser.add_argument("--end_s", action="append", type=lambda v: v if v == "end" else float(v),
+                        required=True,
+                        help="Per-bag end time (s), or 'end' to use the bag's end. "
+                             "Repeat once per --bag_path.")
     parser.add_argument("--calib_root", required=True)
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--hz", type=float, default=10.0)
@@ -406,8 +413,8 @@ def main():
     n_bags = len(args.bag_path)
     print(f"[stitch] {n_bags} bag(s) -> {args.out_dir}", flush=True)
     for i, (bp, s_s, e_s) in enumerate(zip(args.bag_path, args.start_s, args.end_s)):
-        print(f"  [{i}] {bp}  start={s_s}s  end={e_s}s  dur={e_s - s_s:.2f}s",
-              flush=True)
+        dur = "unknown (resolved at bag open)" if e_s == "end" else f"{e_s - s_s:.2f}s"
+        print(f"  [{i}] {bp}  start={s_s}s  end={e_s}s  dur={dur}", flush=True)
 
     out_dir = Path(args.out_dir)
     for sub in ["images", "lidar", "ego_pose", "intrinsics", "extrinsics", "sky_masks"]:
@@ -425,11 +432,15 @@ def main():
         T_lidar_to_cam[i] = load_extrinsic(
             os.path.join(args.calib_root, "lidar_cam_joint_extrinsics", LIDAR_TO_CAM_FILES[i]))
 
-    T_combined_to_imu_frd = load_extrinsic(
-        os.path.join(args.calib_root, "lidar_imu_extrinsic.json"))
-    # Re-express in FLU ego frame so downstream artifacts match drivestudio's
-    # FLU/Z-up convention.
-    T_combined_to_imu = R_FLU_FROM_FRD @ T_combined_to_imu_frd
+    # T_combined_to_imu_frd = load_extrinsic(
+    #     os.path.join(args.calib_root, "lidar_imu_extrinsic.json"))
+    # # Re-express in FLU ego frame so downstream artifacts match drivestudio's
+    # # FLU/Z-up convention.
+    # T_combined_to_imu = R_FLU_FROM_FRD @ T_combined_to_imu_frd
+    
+    H_OXTS_ABOVE_GROUND_M = 0.31
+    T_combined_to_imu = np.eye(4); T_combined_to_imu[2, 3] = -H_OXTS_ABOVE_GROUND_M
+    # (delete the T_combined_to_imu_frd load + R_FLU_FROM_FRD multiplication)
 
     # Cam->ego (= IMU = oxts_link, redefined as FLU), in OpenCV cam convention
     T_cam_to_ego_opencv = {}

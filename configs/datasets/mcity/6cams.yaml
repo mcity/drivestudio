@@ -14,7 +14,8 @@ data:
     downscale_when_loading: [2, 2, 2, 2, 2, 2]
     downscale: 1
     undistort: True
-    test_image_stride: 0
+    test_image_stride: 0     # held-out-every-8 doesn't work for driving video — adjacent frames are too similar.
+                             # Difix uses synthetic off-path trajectories (front_center_interp/s_curve/three_key_poses) instead.
     load_sky_mask: True       # dummy zero-masks written by preprocess; needed for trainer shape
     load_dynamic_mask: False
     load_objects: False

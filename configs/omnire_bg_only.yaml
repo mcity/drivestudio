@@ -127,3 +127,18 @@ logging:
   print_freq: 500
   saveckpt_freq: 15000
   save_seperate_video: True
+
+# ------------- difix3d (opt-in) ------------ #
+# Off by default. Enable with `+difix.enabled=true` on the CLI to run the
+# progressive 3D update that bakes Difix-cleaned novel views into the splat.
+difix:
+  enabled: false
+  model_id: nvidia/difix_ref
+  novel_prob: 0.5
+  novel_data_lambda: 0.3
+  ssim_lambda: 0.2
+  shift_distance: 0.5
+  # num_novel_poses: 120
+  # traj_types: ["front_center_interp", "s_curve", "three_key_poses"] # all types
+  fix_steps: [3000, 5000, 7000, 9000, 11000, 13000, 15000, 17000, 19000, 21000, 23000, 25000, 27000, 29000]
+  save_intermediate_pngs: true
