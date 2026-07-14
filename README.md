@@ -23,6 +23,78 @@ A 3DGS framework for omni urban scene reconstruction and simulation!
   <img src="https://github.com/user-attachments/assets/d2a47e7d-2934-46de-94d6-85ea8a52aba6" width="49%" style="max-width: 100%; height: auto;" />
 </p>
 
+########################################################################################
+
+# Mcity Modifications
+
+Follow this guide: https://autowarefoundation.github.io/autoware-documentation/main/tutorials/integrating-autoware/creating-vehicle-and-sensor-model/calibrating-sensors/lidar-imu-calibration/#lidar-imu-calibration_1
+
+### Convert mcap to bag format
+```bash
+cd /home/ubuntu/OA-LICalib
+python3 script/mcap_to_oalicalib_bag.py \
+  /2TB_drive/recordings/calibration/lidar_imu_cal_4_0.mcap \
+  /2TB_drive/recordings/calibration/lidar_imu_cal_4_0.bag
+```
+
+### Running Pipeline
+Create persistent tmux session since the the calibration can take a long time
+```bash
+tmux new -s calib
+```
+
+Start docker container:
+```bash
+export REPO_PATH="$HOME/OA-LICalib"
+
+sudo docker run -it \
+  --env="DISPLAY" \
+  --volume="$HOME/.Xauthority:/root/.Xauthority:rw" \
+  --volume="/tmp/.X11-unix:/tmp/.X11-unix:rw" \
+  --volume="$REPO_PATH:/root/catkin_oa_calib/src/OA-LICalib" \
+  --volume="/2TB_drive/recordings/calibration/lidar_imu_cal_4_0.bag:/root/catkin_oa_calib/src/OA-LICalib/data/lidar_imu_cal_4_0.bag" \
+  oalicalib bash
+```
+
+Then inside the container:
+```bash
+cd /root/catkin_oa_calib
+catkin_make -DCATKIN_WHITELIST_PACKAGES=""
+source devel/setup.bash
+roslaunch oa_licalib li_calib.launch
+```
+
+### Helpful Visualization tools
+Install the packages
+```bash
+python3 -m pip install --break-system-packages numpy matplotlib
+sudo apt-get install -y pcl-tools     
+```
+
+Prep the map (binary/compressed PCD → downsampled ASCII)
+```bash
+cd /home/ubuntu/OA-LICalib/data
+pcl_voxel_grid figure8_full/refined_map-iter13-seg0.pcd map_ds.pcd -leaf 0.1,0.1,0.1
+pcl_convert_pcd_ascii_binary map_ds.pcd map_ds_ascii.pcd 0
+```
+
+Running
+```bash
+python3 render_traj_overlay.py \
+  --pcd  map_ds_ascii.pcd \
+  --traj figure8_full/trajectory-lidar-40.000000-80.000000-iter13.txt \
+  --out  traj_overlay.png \
+  --margin 10 --zheight 8 --elev 35 --azim -60 --zexag 1 --point-size 1.0
+  
+# --azim / --elev — rotate / tilt the slant (e.g. --azim 30 --elev 20 for a lower, side-ish angle).
+# --margin — zoom: smaller = closer (try --margin 8 to fill the frame with just the figure-8).
+# --zexag — vertical exaggeration in the 3D panel (1 = true scale).
+# --point-size — bump to e.g. 1.5 if the cloud looks too faint to judge alignment.
+```
+
+
+########################################################################################
+
 ## About
 DriveStudio is a 3DGS codebase for urban scene reconstruction/simulation. It offers a system with multiple Gaussian representations to jointly reconstruct backgrounds, vehicles, and non-rigid categories (pedestrians, cyclists, etc.) from driving logs. DriveStudio also provides a unified data system supporting various popular driving datasets, including [Waymo](https://waymo.com/open/), [PandaSet](https://pandaset.org/), [Argoverse2](https://www.argoverse.org/av2.html), [KITTI](http://www.cvlibs.net/datasets/kitti/), [NuScenes](https://www.nuscenes.org/), and [NuPlan](https://www.nuscenes.org/nuplan).
 
