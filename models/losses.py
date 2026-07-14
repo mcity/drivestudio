@@ -166,7 +166,12 @@ class DepthLoss(nn.Module):
         elif self.reduction == "none":
             depth_error = depth_error
         elif self.reduction == "mean_on_hit":
-            depth_error = depth_error.mean()
+            # Guard against frames/cameras with no valid lidar-depth pixels:
+            # tensor.mean() over an empty tensor is NaN, which crashes training
+            # (raised as "NaN detected in loss depth_loss"). With a single lidar,
+            # some camera/frame can get zero projected hits -> contribute 0 here.
+            depth_error = depth_error.mean() if depth_error.numel() > 0 \
+                else depth_error.sum()
         elif self.reduction == "mean_on_hw":
             n = gt_depth.shape[0]*gt_depth.shape[1]
             depth_error = depth_error.sum() / n

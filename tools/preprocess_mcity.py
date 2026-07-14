@@ -1,53 +1,62 @@
-"""Convert one or more Mcity ROS2 mcap bags into a drivestudio scene.
+"""Convert a Mcity ROS2 recording (split across simultaneous mcap bags) into a
+drivestudio scene.
 
-Multiple bags are stitched into a single scene with frame indices that
-continue across bag boundaries. All bags must share the same `map` frame
-(true for bags recorded in the same session against the Mcity map).
+A session is recorded as separate, simultaneous bags that all span the same
+time: camera bag(s) with /arenacam*/images (e.g. camA = cams 1-3, camB = cams
+4-6) and one lidar bag with /rslidar_points + /tf + /ins/*. Sensors are
+PTP-synced, so frames are paired by sensor **header** timestamp, NOT bag/log
+time. The cameras stamp headers in TAI, +37 s ahead of the lidar/INS/tf UTC
+clock (the TAI-UTC leap offset), so --cam_offset_s (default 37) is subtracted
+from every camera header to bring it onto the lidar/tf reference timeline.
 
 Mandatory outputs per frame in {out_dir} (the on-disk layout drivestudio's
 WaymoPixelSource/WaymoLiDARSource expect — directory structure originally
 modeled after the Waymo Open Dataset preprocessing pipeline):
   images/{f:03d}_{c}.jpg         (c in 0..5 = arenacam1..6)
   lidar/{f:03d}.bin              (N x 14 float32, drivestudio lidar schema)
-  ego_pose/{f:03d}.txt           (4x4 matrix, oxts_link -> map)
+  ego_pose/{f:03d}.txt           (4x4 matrix, ego(FLU) -> map)
   intrinsics/{c}.txt             (9 scalars: fx, fy, cx, cy, k1, k2, p1, p2, k3)
   extrinsics/{c}.txt             (4x4 matrix, cam -> ego, in FLU cam convention)
   frame_info.json                (stub metadata)
 
-LiDAR points are gathered from /rslidar_{front,left,right}_points and all
-transformed via T_combined_to_imu — RoboSense P6 houses all three sub-lidars
-at a single coordinate frame (the combined centroid), so the per-lidar
-names in the calibration are just labels for which sub-element was used to
-calibrate each camera pair. The back lidar is recorded but not used (no
-camera covers its FOV). Each point's source is recorded in column 13 of the
-14-col bin (0=front, 1=left, 2=right). Camera-to-ego is composed via:
-    T_cam_to_ego = T_combined_to_imu @ inv(T_lidar_to_cam)
+LiDAR points come from the single RoboSense Ruby+ lidar (/rslidar_points) and
+are transformed into the ego frame via T_lidar_to_ego. The ego is the
+GPS/RTK-fixed IMU (oxts_link), redefined FLU (X-fwd/Y-left/Z-up) so drivestudio
+renders Z-up. Column 13 of the 14-col bin records the lidar source id (always 0
+— single lidar). Camera-to-ego composes straight through the lidar, since the
+cam<->lidar calibration is already T_cam_to_lidar (OpenCV optical convention):
+    T_imu_to_lidar = [ R(q_ItoL) | p_IinL ]          (from lidar<->IMU calib)
+    T_lidar_to_ego = R_FLU_FROM_FRD @ inv(T_imu_to_lidar)
+    T_cam_to_ego   = T_lidar_to_ego @ T_cam_to_lidar
 
-Usage (single bag):
-  python tools/preprocess_mcity.py \
-    --bag_path /scratch/.../may8-2026-downtown-p2_0.mcap \
-    --calib_root /home/billhong/drivestudio/calibration_files \
-    --out_dir /scratch/.../mcity/processed/training/000 \
-    --start_s 180 --end_s 200 --hz 10
+Calibration files under {calib_root} (MATLAB / OA-LICalib formats):
+  cam_intrinsics/intrinsics_matlab{1..6}.json            (K, dist, image size)
+  lidar_cam_extrinsics/cam_to_lidar_matrices_matlab_cam{1..6}.json  (T_cam_to_lidar)
+  lidar_imu_extrinsic.json                               (p_IinL, q_ItoL)
 
-Usage (stitch multiple bags — repeat --bag_path / --start_s / --end_s in order):
+Usage:
   python tools/preprocess_mcity.py \
-    --bag_path /scratch/.../downtown-p2_0.mcap --start_s 145.2 --end_s 165.2 \
-    --bag_path /scratch/.../downtown-p3_0.mcap --start_s 0    --end_s 20 \
+    --lidar_bag /scratch/.../july2-2026/zone_2/lidar_ins_tf/lidar_ins_tf_0.mcap \
+    --cam_bag   /scratch/.../july2-2026/zone_2/camA/camA_0.mcap \
+    --cam_bag   /scratch/.../july2-2026/zone_2/camB/camB_0.mcap \
     --calib_root /home/billhong/drivestudio/calibration_files \
-    --out_dir /scratch/.../mcity/processed/training/d2_d3_combined \
-    --hz 10
+    --out_dir /scratch/.../mcity/processed/training/zone_2 \
+    --start_s 0 --end_s 30 --hz 10
+
+--start_s/--end_s are relative to the first /rslidar_points header stamp;
+use --end_s end for the whole recording.
 """
 import argparse
 import json
 import os
+import struct
 import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 from mcap.reader import make_reader
-from mcap_ros2.reader import read_ros2_messages
+from mcap_ros2.decoder import DecoderFactory
 
 
 OPENCV2DATASET = np.array([
@@ -71,44 +80,44 @@ R_FLU_FROM_FRD = np.array([
 ], dtype=np.float64)
 
 ARENACAM_TOPICS = [f"/arenacam{i+1}/images" for i in range(6)]
-# Lidar topic -> lidar_id written to column 13 of the 14-col bin. All three
-# topics share the same coordinate frame (the P6 combined centroid), so a
-# single T_combined_to_imu transforms all of them.
-LIDAR_TOPICS = {
-    "/rslidar_front_points": 0,
-    "/rslidar_left_points":  1,
-    "/rslidar_right_points": 2,
-}
-# Front lidar is the master clock for picking per-frame timestamps.
-MASTER_LIDAR_TOPIC = "/rslidar_front_points"
+# Single RoboSense Ruby+ lidar; its points get source id 0 in column 13 of the
+# 14-col bin. Also the master clock for choosing per-frame timestamps.
+MASTER_LIDAR_TOPIC = "/rslidar_points"
 TF_TOPIC = "/tf"
-
-# Cam idx 0..5 -> filename in lidar_cam_joint_extrinsics/
-LIDAR_TO_CAM_FILES = {
-    0: "front_lidar-to-cam1-extrinsic.json",
-    1: "front_lidar-to-cam2-extrinsic.json",
-    2: "left_lidar-to-cam3-extrinsic.json",
-    3: "right_lidar-to-cam4-extrinsic.json",
-    4: "left_lidar-to-cam5-extrinsic.json",
-    5: "right_lidar-to-cam6-extrinsic.json",
-}
 
 
 def load_intrinsic(path):
+    """MATLAB-format intrinsics: camera_matrix (3x3), dist_coeffs
+    (k1,k2,p1,p2,k3), image_width/height."""
     with open(path) as f:
         d = json.load(f)
-    inner = d[next(iter(d))]["param"]
-    K = np.array(inner["cam_K"]["data"], dtype=np.float64)
-    dist = np.array(inner["cam_dist"]["data"], dtype=np.float64).flatten()
-    w, h = inner["img_dist_w"], inner["img_dist_h"]
+    K = np.array(d["camera_matrix"], dtype=np.float64)
+    dist = np.array(d["dist_coeffs"], dtype=np.float64).flatten()
+    w, h = d["image_width"], d["image_height"]
     return K, dist, (w, h)
 
 
-def load_extrinsic(path):
+def load_cam_to_lidar(path):
+    """MATLAB-format cam<->lidar extrinsic: a single 'cam_<n>' key holding a 4x4
+    T_cam_to_lidar in OpenCV optical convention (p_lidar = T @ p_cam,
+    camera x-right / y-down / z-forward)."""
     with open(path) as f:
         d = json.load(f)
-    inner = d[next(iter(d))]["param"]
-    T = np.array(inner["sensor_calib"]["data"], dtype=np.float64)
+    key = next(k for k in d if k.startswith("cam_"))
+    return np.array(d[key], dtype=np.float64)
+
+
+def load_lidar_imu(path):
+    """Lidar<->IMU calib -> T_imu_to_lidar (4x4). p_IinL is the IMU origin
+    expressed in the lidar frame; q_ItoL is the IMU->lidar rotation (x,y,z,w),
+    so a point's IMU coords map to lidar coords via p_L = R(q_ItoL) @ p_I + p_IinL."""
+    with open(path) as f:
+        d = json.load(f)
+    p = d["lidar_imu_extrinsic"]["param"]
+    t, q = p["p_IinL"], p["q_ItoL"]
+    T = np.eye(4)
+    T[:3, :3] = quat_to_R(q["x"], q["y"], q["z"], q["w"])
+    T[:3, 3] = [t["x"], t["y"], t["z"]]
     return T
 
 
@@ -205,247 +214,259 @@ def get_bag_time_range(bag_path):
         return s.statistics.message_start_time, s.statistics.message_end_time
 
 
-def process_bag(bag_path, start_s, end_s, hz, out_dir, frame_offset,
-                T_combined_to_imu, jpeg_quality):
-    """Process one bag's window and write frames into out_dir starting at
-    frame_offset. Returns (frames_written, last_ego_to_map) or
-    (0, None) if no frames were written."""
-    print(f"\n========== bag: {os.path.basename(bag_path)}  "
-          f"window: {start_s}..{end_s} s  frame_offset: {frame_offset} ==========",
-          flush=True)
+def hdr_stamp_ns(data):
+    """std_msgs/Header stamp (ns) straight from raw CDR bytes — no decode. Image
+    and PointCloud2 both begin with std_msgs/Header, so after the 4-byte CDR
+    encapsulation the layout is int32 sec, uint32 nanosec (the same trick the
+    LCECalib exporter uses). Avoids decoding 230k-point clouds just to time them."""
+    sec, nsec = struct.unpack_from("<iI", data, 4)
+    return sec * 1_000_000_000 + nsec
 
-    bag_start_ns, bag_end_ns = get_bag_time_range(bag_path)
-    abs_start = bag_start_ns + int(start_s * 1e9)
+
+def first_lidar_header_ns(lidar_bag):
+    """UTC header stamp (ns) of the first /rslidar_points scan — the scene time
+    origin that --start_s/--end_s are measured from."""
+    with open(lidar_bag, "rb") as f:
+        for _, ch, msg in make_reader(f).iter_messages(topics=[MASTER_LIDAR_TOPIC]):
+            return hdr_stamp_ns(msg.data)
+    sys.exit(f"ERROR: no {MASTER_LIDAR_TOPIC} in {lidar_bag}")
+
+
+def process_scene(cam_bags, lidar_bag, start_s, end_s, hz, out_dir,
+                  T_lidar_to_ego, jpeg_quality, cam_offset_s):
+    """Convert one recording session (simultaneous split bags) into frames
+    [0..N). Pairing uses PTP sensor header stamps on the lidar/INS/tf UTC clock;
+    camera header stamps are shifted by -cam_offset_s (TAI->UTC) onto it.
+    Returns (num_frames, end_s_resolved)."""
+    print(f"\n========== scene: lidar={os.path.basename(lidar_bag)}  "
+          f"cams={[os.path.basename(b) for b in cam_bags]} ==========", flush=True)
+    cam_off_ns = int(round(cam_offset_s * 1e9))
+    # Log-time slack for the windowed reads: every bag's log_time sits ~UTC+0..0.3s,
+    # so [win-MARGIN, win+MARGIN] on log_time over-captures the UTC-header window
+    # (incl. cameras, whose log ~ UTC despite their +37s TAI header stamps).
+    MARGIN_NS = 2_000_000_000
+
+    # --- Window on the lidar UTC-header timeline (start_s/end_s from 1st scan) ---
+    u0 = first_lidar_header_ns(lidar_bag)
+    _, lidar_log_end = get_bag_time_range(lidar_bag)
+    win_start = u0 + int(start_s * 1e9)
     if isinstance(end_s, str) and end_s == "end":
-        abs_end = bag_end_ns
-        end_s = (bag_end_ns - bag_start_ns) / 1e9
+        win_end = None
+        end_disp = (lidar_log_end - u0) / 1e9
     else:
-        abs_end = bag_start_ns + int(end_s * 1e9)
-    print(f"[info] bag span: {bag_start_ns} .. {bag_end_ns}  "
-          f"(duration {(bag_end_ns - bag_start_ns)/1e9:.1f} s)", flush=True)
-    print(f"[info] window:   {abs_start} .. {abs_end}  "
-          f"({start_s}..{end_s:.2f} s)", flush=True)
+        win_end = u0 + int(end_s * 1e9)
+        end_disp = float(end_s)
+    log_lo = win_start - MARGIN_NS
+    log_hi = lidar_log_end if win_end is None else win_end + MARGIN_NS
 
-    # --- Pass 1: gather lidar timestamps + tf transforms ---
-    print("[pass1] scanning lidar + tf...", flush=True)
+    def in_win(u):
+        return u >= win_start and (win_end is None or u <= win_end)
+
+    print(f"[info] window {start_s}..{end_disp:.2f}s on lidar UTC header clock; "
+          f"cam_offset={cam_offset_s}s", flush=True)
+
+    # --- Pass 1 (lidar bag): master lidar header stamps + tf map->oxts_link ---
+    print("[pass1] scanning lidar headers + tf...", flush=True)
     lidar_ns = []
     tf_entries = []
-    for m in read_ros2_messages(
-        bag_path, topics=[MASTER_LIDAR_TOPIC, TF_TOPIC],
-        start_time=abs_start, end_time=abs_end,
-    ):
-        topic = m.channel.topic
-        ns = m.log_time_ns
-        if topic == MASTER_LIDAR_TOPIC:
-            lidar_ns.append(ns)
-        elif topic == TF_TOPIC:
-            for tr in m.ros_msg.transforms:
-                if tr.header.frame_id == "map" and tr.child_frame_id == "oxts_link":
-                    # Right-multiply by R to redefine source frame from FRD
-                    # oxts_link to FLU: ego_flu_to_map = ego_frd_to_map @ R.
-                    T = transform_to_matrix(tr.transform) @ R_FLU_FROM_FRD
-                    tf_entries.append((ns, T))
+    with open(lidar_bag, "rb") as f:
+        fac = DecoderFactory()
+        for schema, ch, msg in make_reader(f).iter_messages(
+                topics=[MASTER_LIDAR_TOPIC, TF_TOPIC],
+                start_time=log_lo, end_time=log_hi):
+            if ch.topic == MASTER_LIDAR_TOPIC:
+                u = hdr_stamp_ns(msg.data)
+                if in_win(u):
+                    lidar_ns.append(u)
+            else:
+                for tr in fac.decoder_for("cdr", schema)(msg.data).transforms:
+                    if tr.header.frame_id == "map" and tr.child_frame_id == "oxts_link":
+                        u = stamp_to_ns(tr.header.stamp)
+                        if in_win(u):
+                            # ego_flu_to_map = ego_frd_to_map @ R_FLU_FROM_FRD
+                            T = transform_to_matrix(tr.transform) @ R_FLU_FROM_FRD
+                            tf_entries.append((u, T))
     lidar_ns.sort()
     tf_entries.sort(key=lambda x: x[0])
     print(f"[pass1] master-lidar msgs: {len(lidar_ns)}, tf map->oxts: {len(tf_entries)}",
           flush=True)
     if not lidar_ns:
-        sys.exit(f"ERROR: no front_lidar in {bag_path} window.")
+        sys.exit(f"ERROR: no {MASTER_LIDAR_TOPIC} in window.")
     if not tf_entries:
-        sys.exit(f"ERROR: no /tf map->oxts_link in {bag_path} window.")
+        sys.exit("ERROR: no /tf map->oxts_link in window.")
 
-    # --- Pick master timestamps at target Hz from lidar timestamps ---
+    # --- Subsample master timestamps to target Hz ---
     period_ns = int(1e9 / hz)
     master_ns = [lidar_ns[0]]
-    for ns in lidar_ns[1:]:
-        if ns - master_ns[-1] >= period_ns - period_ns // 10:
-            master_ns.append(ns)
-    print(f"[pass1] master frames: {len(master_ns)} @ ~{hz} Hz", flush=True)
+    for u in lidar_ns[1:]:
+        if u - master_ns[-1] >= period_ns - period_ns // 10:
+            master_ns.append(u)
+    N = len(master_ns)
+    master_arr = np.array(master_ns)
+    print(f"[pass1] master frames: {N} @ ~{hz} Hz", flush=True)
 
-    # --- Compute ego_pose per master frame (nearest tf) ---
+    # --- ego_pose per master frame (nearest tf by header stamp) ---
     tf_ns_arr = np.array([t[0] for t in tf_entries])
     tf_T_list = [t[1] for t in tf_entries]
-    ego_to_map_per_frame = []
-    for fi_local, ns in enumerate(master_ns):
-        idx = int(np.argmin(np.abs(tf_ns_arr - ns)))
-        delta_ms = abs(int(tf_ns_arr[idx] - ns)) / 1e6
-        if delta_ms > 50:
-            print(f"  [warn] local frame {fi_local}: nearest tf is {delta_ms:.1f} ms away",
-                  flush=True)
-        fi_global = frame_offset + fi_local
-        ego_to_map_per_frame.append(tf_T_list[idx])
-        np.savetxt(out_dir / "ego_pose" / f"{fi_global:03d}.txt", tf_T_list[idx])
-    print(f"[pass1] wrote {len(master_ns)} ego_pose files "
-          f"({frame_offset:03d}..{frame_offset + len(master_ns) - 1:03d})",
-          flush=True)
+    for i, u in enumerate(master_ns):
+        j = int(np.argmin(np.abs(tf_ns_arr - u)))
+        dms = abs(int(tf_ns_arr[j] - u)) / 1e6
+        if dms > 50:
+            print(f"  [warn] frame {i}: nearest tf is {dms:.1f} ms away", flush=True)
+        np.savetxt(out_dir / "ego_pose" / f"{i:03d}.txt", tf_T_list[j])
+    print(f"[pass1] wrote {N} ego_pose files", flush=True)
 
-    master_arr = np.array(master_ns)
+    # --- Pass 2a (lidar bag): keep the scan nearest each master frame ---
+    print("[pass2a] streaming lidar clouds...", flush=True)
+    best_lidar = [None] * N   # (delta_ns, decoded_msg)
+    with open(lidar_bag, "rb") as f:
+        fac = DecoderFactory()
+        for schema, ch, msg in make_reader(f).iter_messages(
+                topics=[MASTER_LIDAR_TOPIC], start_time=log_lo, end_time=log_hi):
+            u = hdr_stamp_ns(msg.data)
+            if not in_win(u):
+                continue
+            i = int(np.argmin(np.abs(master_arr - u)))
+            d = abs(int(master_arr[i] - u))
+            if best_lidar[i] is None or d < best_lidar[i][0]:
+                best_lidar[i] = (d, fac.decoder_for("cdr", schema)(msg.data))
 
-    # --- Pass 2: stream images + lidar, buffer best per (local frame, topic) ---
-    print("[pass2] streaming images + lidar...", flush=True)
-    best_img = [[None] * 6 for _ in range(len(master_ns))]
-    # best_lidar[frame_idx] = {topic: (delta_ns, msg)} per lidar source
-    best_lidar = [dict() for _ in range(len(master_ns))]
+    # --- Pass 2b (camera bags): keep the frame nearest each master, per cam.
+    #     Camera header (TAI) is shifted by -cam_off_ns onto the lidar UTC clock. ---
+    print("[pass2b] streaming camera images...", flush=True)
+    best_img = [[None] * 6 for _ in range(N)]
+    for cb in cam_bags:
+        n_win = 0
+        with open(cb, "rb") as f:
+            fac = DecoderFactory()   # fresh per file: mcap schema ids are per-file
+            for schema, ch, msg in make_reader(f).iter_messages(
+                    topics=ARENACAM_TOPICS, start_time=log_lo, end_time=log_hi):
+                u = hdr_stamp_ns(msg.data) - cam_off_ns
+                if not in_win(u):
+                    continue
+                n_win += 1
+                i = int(np.argmin(np.abs(master_arr - u)))
+                d = abs(int(master_arr[i] - u))
+                ci = int(ch.topic[len("/arenacam"):].split("/")[0]) - 1
+                if best_img[i][ci] is None or d < best_img[i][ci][0]:
+                    best_img[i][ci] = (d, fac.decoder_for("cdr", schema)(msg.data))
+        print(f"  {os.path.basename(cb)}: {n_win} in-window camera msgs", flush=True)
 
-    n_seen = 0
-    for m in read_ros2_messages(
-        bag_path, topics=ARENACAM_TOPICS + list(LIDAR_TOPICS.keys()),
-        start_time=abs_start, end_time=abs_end,
-    ):
-        n_seen += 1
-        if n_seen % 2000 == 0:
-            print(f"  ...seen {n_seen} msgs", flush=True)
-        ns = m.log_time_ns
-        idx = int(np.argmin(np.abs(master_arr - ns)))
-        delta = int(abs(master_arr[idx] - ns))
-        topic = m.channel.topic
-        if topic in LIDAR_TOPICS:
-            cur = best_lidar[idx].get(topic)
-            if cur is None or delta < cur[0]:
-                best_lidar[idx][topic] = (delta, m.ros_msg)
-        else:
-            cam_idx = int(topic[len("/arenacam"):].split("/")[0]) - 1
-            cur = best_img[idx][cam_idx]
-            if cur is None or delta < cur[0]:
-                best_img[idx][cam_idx] = (delta, m.ros_msg)
-    print(f"[pass2] total msgs streamed: {n_seen}", flush=True)
-
-    # --- Backfill missing camera frames from nearest available frame in same cam ---
-    backfilled = []
+    # --- Backfill missing (frame,cam) from the nearest available frame per cam ---
+    backfilled = 0
     for ci in range(6):
-        present = [fi for fi in range(len(master_ns)) if best_img[fi][ci] is not None]
+        present = [i for i in range(N) if best_img[i][ci] is not None]
         if not present:
-            print(f"  [warn] cam {ci}: NO frames available in window", flush=True)
+            print(f"  [warn] cam {ci} (arenacam{ci+1}): NO frames in window", flush=True)
             continue
         present_arr = np.array(present)
-        for fi in range(len(master_ns)):
-            if best_img[fi][ci] is None:
-                nearest = present[int(np.argmin(np.abs(present_arr - fi)))]
-                best_img[fi][ci] = best_img[nearest][ci]
-                backfilled.append((fi, ci, nearest))
+        for i in range(N):
+            if best_img[i][ci] is None:
+                nn = present[int(np.argmin(np.abs(present_arr - i)))]
+                best_img[i][ci] = best_img[nn][ci]
+                backfilled += 1
     if backfilled:
-        print(f"  [info] backfilled {len(backfilled)} missing (frame,cam) "
-              f"entries (first few: {backfilled[:5]})", flush=True)
+        print(f"  [info] backfilled {backfilled} missing (frame,cam) entries", flush=True)
 
     # --- Write images + sky_masks ---
     print("[write] images + sky_masks...", flush=True)
-    for fi_local in range(len(master_ns)):
-        fi_global = frame_offset + fi_local
+    for i in range(N):
         for ci in range(6):
-            entry = best_img[fi_local][ci]
+            entry = best_img[i][ci]
             if entry is None:
                 continue
             img = decode_image(entry[1])
             h, w = img.shape[:2]
-            cv2.imwrite(str(out_dir / "images" / f"{fi_global:03d}_{ci}.jpg"),
+            cv2.imwrite(str(out_dir / "images" / f"{i:03d}_{ci}.jpg"),
                         img, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
-            sky = np.zeros((h, w), dtype=np.uint8)
-            cv2.imwrite(str(out_dir / "sky_masks" / f"{fi_global:03d}_{ci}.png"), sky)
+            cv2.imwrite(str(out_dir / "sky_masks" / f"{i:03d}_{ci}.png"),
+                        np.zeros((h, w), dtype=np.uint8))
 
-    # --- Write lidar (concatenate front + left + right) ---
+    # --- Write lidar (single lidar -> source id 0 in column 13) ---
     print("[write] lidar...", flush=True)
-    origin_ego = T_combined_to_imu[:3, 3].astype(np.float32)
-    missing_counts = {topic: 0 for topic in LIDAR_TOPICS}
-    for fi_local in range(len(master_ns)):
-        fi_global = frame_offset + fi_local
-        per_topic = best_lidar[fi_local]
-        if not per_topic:
-            print(f"  [warn] frame {fi_global}: no lidar from any topic", flush=True)
+    origin_ego = T_lidar_to_ego[:3, 3].astype(np.float32)
+    n_missing = 0
+    for i in range(N):
+        if best_lidar[i] is None:
+            n_missing += 1
+            print(f"  [warn] frame {i}: no lidar in window", flush=True)
             continue
-
-        parts = []
-        for topic, lidar_id in LIDAR_TOPICS.items():
-            entry = per_topic.get(topic)
-            if entry is None:
-                missing_counts[topic] += 1
-                continue
-            xyz, intensity = decode_pointcloud2(entry[1])
-            pts_ego = transform_points(
-                T_combined_to_imu, xyz.astype(np.float64)
-            ).astype(np.float32)
-            n = len(pts_ego)
-            origins = np.broadcast_to(origin_ego, (n, 3)).copy()
-            flows = np.zeros((n, 3), dtype=np.float32)
-            flow_class = np.full((n, 1), -1.0, dtype=np.float32)
-            ground = np.zeros((n, 1), dtype=np.float32)
-            inten = intensity.reshape(-1, 1).astype(np.float32)
-            elong = np.zeros((n, 1), dtype=np.float32)
-            lid_id = np.full((n, 1), float(lidar_id), dtype=np.float32)
-            parts.append(np.concatenate(
-                [origins, pts_ego, flows, flow_class, ground, inten, elong, lid_id],
-                axis=1,
-            ))
-
-        out = np.concatenate(parts, axis=0)
+        xyz, intensity = decode_pointcloud2(best_lidar[i][1])
+        pts_ego = transform_points(
+            T_lidar_to_ego, xyz.astype(np.float64)).astype(np.float32)
+        n = len(pts_ego)
+        origins = np.broadcast_to(origin_ego, (n, 3)).copy()
+        flows = np.zeros((n, 3), dtype=np.float32)
+        flow_class = np.full((n, 1), -1.0, dtype=np.float32)
+        ground = np.zeros((n, 1), dtype=np.float32)
+        inten = intensity.reshape(-1, 1).astype(np.float32)
+        elong = np.zeros((n, 1), dtype=np.float32)
+        lid_id = np.zeros((n, 1), dtype=np.float32)   # single lidar -> id 0
+        out = np.concatenate(
+            [origins, pts_ego, flows, flow_class, ground, inten, elong, lid_id], axis=1)
         assert out.shape[1] == 14, out.shape
-        out.astype(np.float32).tofile(out_dir / "lidar" / f"{fi_global:03d}.bin")
+        out.astype(np.float32).tofile(out_dir / "lidar" / f"{i:03d}.bin")
+    if n_missing:
+        print(f"  [info] lidar missing on {n_missing}/{N} frames", flush=True)
 
-    for topic, n_missing in missing_counts.items():
-        if n_missing:
-            print(f"  [info] {topic}: missing on {n_missing}/{len(master_ns)} frames",
-                  flush=True)
-
-    return len(master_ns), ego_to_map_per_frame[0], ego_to_map_per_frame[-1]
+    return N, end_disp
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--bag_path", action="append", required=True,
-                        help="Bag path. Repeat with matching --start_s/--end_s "
-                             "to stitch multiple bags into one scene.")
-    parser.add_argument("--start_s", action="append", type=float, required=True,
-                        help="Per-bag start time (s). Repeat once per --bag_path.")
-    parser.add_argument("--end_s", action="append", type=lambda v: v if v == "end" else float(v),
-                        required=True,
-                        help="Per-bag end time (s), or 'end' to use the bag's end. "
-                             "Repeat once per --bag_path.")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--lidar_bag", required=True,
+                        help="bag with /rslidar_points + /tf + /ins/* (e.g. lidar_ins_tf).")
+    parser.add_argument("--cam_bag", action="append", required=True,
+                        help="camera bag with /arenacam*/images; repeat once per bag "
+                             "(e.g. camA for cams 1-3, camB for cams 4-6).")
+    parser.add_argument("--start_s", type=float, default=0.0,
+                        help="window start (s) from the first /rslidar_points header.")
+    parser.add_argument("--end_s", type=lambda v: v if v == "end" else float(v),
+                        default="end", help="window end (s), or 'end' for the whole bag.")
+    parser.add_argument("--cam_offset_s", type=float, default=37.0,
+                        help="seconds subtracted from camera header stamps to align them "
+                             "(TAI) to the lidar/INS/tf clock (UTC). TAI-UTC = 37 s.")
     parser.add_argument("--calib_root", required=True)
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--hz", type=float, default=10.0)
     parser.add_argument("--jpeg_quality", type=int, default=92)
     args = parser.parse_args()
 
-    if not (len(args.bag_path) == len(args.start_s) == len(args.end_s)):
-        sys.exit(f"ERROR: --bag_path/--start_s/--end_s counts mismatch: "
-                 f"{len(args.bag_path)}/{len(args.start_s)}/{len(args.end_s)}")
-
-    # Infor print on user input for what bags to stitch together
-    n_bags = len(args.bag_path)
-    print(f"[stitch] {n_bags} bag(s) -> {args.out_dir}", flush=True)
-    for i, (bp, s_s, e_s) in enumerate(zip(args.bag_path, args.start_s, args.end_s)):
-        dur = "unknown (resolved at bag open)" if e_s == "end" else f"{e_s - s_s:.2f}s"
-        print(f"  [{i}] {bp}  start={s_s}s  end={e_s}s  dur={dur}", flush=True)
+    print(f"[scene] lidar_bag = {args.lidar_bag}", flush=True)
+    for b in args.cam_bag:
+        print(f"[scene] cam_bag   = {b}", flush=True)
+    print(f"[scene] -> {args.out_dir}", flush=True)
 
     out_dir = Path(args.out_dir)
     for sub in ["images", "lidar", "ego_pose", "intrinsics", "extrinsics", "sky_masks"]:
         (out_dir / sub).mkdir(parents=True, exist_ok=True)
 
-    # --- Calibration (shared across all bags) ---
+    # --- Calibration ---
     cam_K = {}; cam_dist = {}; cam_size = {}
     for i in range(6):
         K, dist, size = load_intrinsic(
-            os.path.join(args.calib_root, "cam_intrinsics", f"cam{i+1}_intrinsic.json"))
+            os.path.join(args.calib_root, "cam_intrinsics", f"intrinsics_matlab{i+1}.json"))
         cam_K[i] = K; cam_dist[i] = dist; cam_size[i] = size
 
-    T_lidar_to_cam = {}
+    # T_cam_to_lidar[i]: camera i (OpenCV optical) -> lidar frame, read directly.
+    T_cam_to_lidar = {}
     for i in range(6):
-        T_lidar_to_cam[i] = load_extrinsic(
-            os.path.join(args.calib_root, "lidar_cam_joint_extrinsics", LIDAR_TO_CAM_FILES[i]))
+        T_cam_to_lidar[i] = load_cam_to_lidar(os.path.join(
+            args.calib_root, "lidar_cam_extrinsics",
+            f"cam_to_lidar_matrices_matlab_cam{i+1}.json"))
 
-    # T_combined_to_imu_frd = load_extrinsic(
-    #     os.path.join(args.calib_root, "lidar_imu_extrinsic.json"))
-    # # Re-express in FLU ego frame so downstream artifacts match drivestudio's
-    # # FLU/Z-up convention.
-    # T_combined_to_imu = R_FLU_FROM_FRD @ T_combined_to_imu_frd
-    
-    H_OXTS_ABOVE_GROUND_M = 0.31
-    T_combined_to_imu = np.eye(4); T_combined_to_imu[2, 3] = -H_OXTS_ABOVE_GROUND_M
-    # (delete the T_combined_to_imu_frd load + R_FLU_FROM_FRD multiplication)
+    # Lidar -> ego. Ego is the GPS/RTK-fixed IMU (oxts_link, FRD), redefined FLU
+    # (X-fwd/Y-left/Z-up) so drivestudio renders Z-up; ego_pose applies the same
+    # R_FLU_FROM_FRD. T_imu_to_lidar comes from the lidar<->IMU calibration.
+    T_imu_to_lidar = load_lidar_imu(
+        os.path.join(args.calib_root, "lidar_imu_extrinsic.json"))
+    T_lidar_to_ego = R_FLU_FROM_FRD @ np.linalg.inv(T_imu_to_lidar)
 
-    # Cam->ego (= IMU = oxts_link, redefined as FLU), in OpenCV cam convention
-    T_cam_to_ego_opencv = {}
-    for i in range(6):
-        T_cam_to_ego_opencv[i] = T_combined_to_imu @ np.linalg.inv(T_lidar_to_cam[i])
+    # Cam->ego (OpenCV cam convention), composed straight through the lidar.
+    T_cam_to_ego_opencv = {
+        i: T_lidar_to_ego @ T_cam_to_lidar[i] for i in range(6)
+    }
 
     # drivestudio's loader applies: cam_to_ego = file @ OPENCV2DATASET
     # => file = T_cam_to_ego_opencv @ inv(OPENCV2DATASET)
@@ -463,40 +484,25 @@ def main():
                 f.write(f"{v}\n")
         np.savetxt(out_dir / "extrinsics" / f"{i}.txt", extrinsic_for_file[i])
 
-    # --- Process each bag, accumulating frame indices ---
-    frame_offset = 0
-    prev_last_ego_to_map = None
-    segments_meta = []
-    for bag_path, s_s, e_s in zip(args.bag_path, args.start_s, args.end_s):
-        n, first_ego, last_ego = process_bag(
-            bag_path, s_s, e_s, args.hz, out_dir, frame_offset,
-            T_combined_to_imu, args.jpeg_quality)
-        segments_meta.append({
-            "bag": os.path.basename(bag_path),
-            "start_s": s_s, "end_s": e_s,
-            "frame_start": frame_offset, "frame_end": frame_offset + n - 1,
-            "num_frames": n,
-        })
-        # Sanity check: distance between previous bag's last ego_to_map
-        # translation and this bag's first. Large jump => map frames disagree.
-        if prev_last_ego_to_map is not None:
-            d = np.linalg.norm(first_ego[:3, 3] - prev_last_ego_to_map[:3, 3])
-            print(f"[stitch] gap to previous bag's last ego pose: {d:.2f} m "
-                  f"(large >> ~vehicle-motion-between-bags suggests map-frame mismatch)",
-                  flush=True)
-        prev_last_ego_to_map = last_ego
-        frame_offset += n
+    # --- Process the scene (one session across the simultaneous bags) ---
+    n, end_disp = process_scene(
+        args.cam_bag, args.lidar_bag, args.start_s, args.end_s, args.hz,
+        out_dir, T_lidar_to_ego, args.jpeg_quality, args.cam_offset_s)
 
     # --- Frame info ---
     with open(out_dir / "frame_info.json", "w") as f:
         json.dump({
             "time_of_day": "Day",
-            "location": "mcity_downtown",
+            "location": "mcity",
             "weather": "unknown",
-            "segments": segments_meta,
+            "num_frames": n,
+            "start_s": args.start_s, "end_s": end_disp, "hz": args.hz,
+            "cam_offset_s": args.cam_offset_s,
+            "lidar_bag": os.path.basename(args.lidar_bag),
+            "cam_bags": [os.path.basename(b) for b in args.cam_bag],
         }, f, indent=2)
 
-    print(f"\n[done] wrote {frame_offset} frames to {out_dir}", flush=True)
+    print(f"\n[done] wrote {n} frames to {out_dir}", flush=True)
 
 
 if __name__ == "__main__":

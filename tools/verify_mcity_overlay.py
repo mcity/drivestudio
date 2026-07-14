@@ -39,6 +39,11 @@ def project_one(scene_dir: Path, frame: int, cam: int, out_dir: Path):
     K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
     dist = np.array([k1, k2, p1, p2, k3], dtype=np.float64)
 
+    # Undistort with the same K, exactly as the loader does (cv2.undistort with
+    # undistort=True in the mcity config). The model consumes this undistorted
+    # image under a pinhole K, so we project with K and NO distortion below.
+    img = cv2.undistort(img, K, dist)
+
     extr_file = np.loadtxt(scene_dir / "extrinsics" / f"{cam}.txt")
     # loader: cam_to_ego = file @ OPENCV2DATASET -> T_opencv_cam_to_ego
     T_cam_to_ego = extr_file @ OPENCV2DATASET
@@ -53,9 +58,9 @@ def project_one(scene_dir: Path, frame: int, cam: int, out_dir: Path):
     pts_cam = pts_cam[in_front]
     depths = pts_cam[:, 2]
 
-    rvec = np.zeros(3); tvec = np.zeros(3)
-    uv, _ = cv2.projectPoints(pts_cam.reshape(-1, 1, 3), rvec, tvec, K, dist)
-    uv = uv.reshape(-1, 2)
+    # pinhole projection onto the undistorted image (distortion already removed)
+    uv = (K @ pts_cam.T).T
+    uv = uv[:, :2] / uv[:, 2:3]
 
     valid = (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
     uv = uv[valid]; depths = depths[valid]
